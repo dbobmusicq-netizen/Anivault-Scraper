@@ -28,8 +28,12 @@ function proxiedHlsUrl(req: Request, url: string, ref?: string): string {
   return `${publicBase(req)}/api/proxy/hls?url=${encodeURIComponent(url)}${refParam}`;
 }
 
-function proxiedVideoUrl(req: Request, url: string): string {
-  return `${publicBase(req)}/api/proxy/video?url=${encodeURIComponent(url)}`;
+function proxiedVideoUrl(req: Request, url: string, ref?: string): string {
+  // URLSearchParams correctly encodes both parameters, including referers that
+  // contain their own query strings or reserved URL characters.
+  const params = new URLSearchParams({ url });
+  if (ref) params.set('ref', ref);
+  return `${publicBase(req)}/api/proxy/video?${params.toString()}`;
 }
 
 function proxiedSubtitleUrl(req: Request, url: string, ref?: string): string {
@@ -546,23 +550,58 @@ router.get('/proxy/subtitle', async (req: Request, res: Response) => {
 });
 
 router.get('/proxy/video', async (req: Request, res: Response) => {
-  const url = req.query.url as string | undefined;
+  const url = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+  const rawRef = typeof req.query.ref === 'string' ? req.query.ref.trim() : '';
   if (!url) return res.status(400).json({ error: 'Missing ?url=' });
-  if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: '?url must be absolute http(s)' });
 
+  let target: URL;
   try {
-    const upstream = await axios.get(url, {
+    target = new URL(url);
+  } catch {
+    return res.status(400).json({ error: '?url must be a valid absolute HTTP(S) URL' });
+  }
+  if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+    return res.status(400).json({ error: '?url must use HTTP or HTTPS' });
+  }
+  if (target.username || target.password) {
+    return res.status(400).json({ error: 'Credentials in ?url are not allowed' });
+  }
+
+  // Keep the historical fallback for callers that predate the optional `ref`
+  // parameter. When a scraper supplies a referer, only accept valid HTTP(S)
+  // URLs and derive Origin from that parsed URL (never from raw user text).
+  let referer = 'https://animeheaven.me/';
+  let origin = 'https://animeheaven.me';
+  if (rawRef) {
+    let parsedRef: URL;
+    try {
+      parsedRef = new URL(rawRef);
+    } catch {
+      return res.status(400).json({ error: '?ref must be a valid absolute HTTP(S) URL' });
+    }
+    if ((parsedRef.protocol !== 'http:' && parsedRef.protocol !== 'https:') || parsedRef.username || parsedRef.password) {
+      return res.status(400).json({ error: '?ref must be an HTTP(S) URL without credentials' });
+    }
+    referer = parsedRef.toString();
+    origin = parsedRef.origin;
+  }
+
+  let upstreamData: any;
+  try {
+    const upstream = await axios.get(target.toString(), {
       responseType: 'stream',
       timeout: 20000,
+      maxRedirects: 5,
       headers: {
         'User-Agent': 'Mozilla/5.0',
         'Accept': '*/*',
-        'Referer': 'https://animeheaven.me/',
-        'Origin': 'https://animeheaven.me',
-        ...(req.headers.range ? { Range: req.headers.range } : {}),
+        'Referer': referer,
+        'Origin': origin,
+        ...(typeof req.headers.range === 'string' ? { Range: req.headers.range } : {}),
       },
       validateStatus: (status) => (status >= 200 && status < 300) || status === 206,
     });
+    upstreamData = upstream.data;
 
     res.status(upstream.status);
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -578,8 +617,23 @@ router.get('/proxy/video', async (req: Request, res: Response) => {
       }
     }
 
-    return upstream.data.pipe(res);
+    // Stop upstream transfer when the client disconnects to avoid wasting
+    // bandwidth. Stream failures after headers are sent must close the response
+    // rather than attempting to write a second JSON response.
+    upstreamData.on('error', (error: Error) => {
+      if (!res.headersSent) {
+        res.status(502).json({ error: 'Video upstream stream failed' });
+      } else {
+        res.destroy(error);
+      }
+    });
+    res.on('close', () => {
+      if (!res.writableEnded && upstreamData && !upstreamData.destroyed) upstreamData.destroy();
+    });
+    return upstreamData.pipe(res);
   } catch (e: any) {
+    if (upstreamData && !upstreamData.destroyed) upstreamData.destroy();
+    if (res.headersSent) return res.destroy();
     return res.status(e?.response?.status || 502).json({ error: 'Video proxy failed', detail: e?.message || String(e) });
   }
 });
